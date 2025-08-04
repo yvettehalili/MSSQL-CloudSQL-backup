@@ -30,7 +30,7 @@ fi
 # For simplicity and to avoid creating a credential per instance, we'll use the IP from the first line of the config file.
 echo "Checking for and creating/updating SQL Server credential for GCS..."
 FIRST_HOST_IP=$(head -n 1 "$DB_LIST_FILE" | awk -F, '{print $2}' | xargs)
-CONNECTION_STRING="sqlcmd -S tcp:$FIRST_HOST_IP,$SQL_SERVER_PORT -U \"$SQL_SERVER_USER\" -P \"$SQL_SERVER_PASSWORD\""
+
 SQL_CREDENTIAL_QUERY="
 IF NOT EXISTS (SELECT * FROM sys.credentials WHERE name = '$SQL_CREDENTIAL_NAME')
     CREATE CREDENTIAL [$SQL_CREDENTIAL_NAME] WITH IDENTITY = 'S3 Access Key', SECRET = '$HMAC_SECRET';
@@ -38,7 +38,8 @@ ELSE
     ALTER CREDENTIAL [$SQL_CREDENTIAL_NAME] WITH IDENTITY = 'S3 Access Key', SECRET = '$HMAC_SECRET';
 GO
 "
-echo "$SQL_CREDENTIAL_QUERY" | $CONNECTION_STRING
+# Execute the command with careful quoting of the password
+echo "$SQL_CREDENTIAL_QUERY" | sqlcmd -S tcp:"$FIRST_HOST_IP","$SQL_SERVER_PORT" -U "$SQL_SERVER_USER" -P "$SQL_SERVER_PASSWORD"
 if [ $? -ne 0 ]; then
     echo "ERROR: Failed to create or update the SQL Server credential. Check your HMAC keys and permissions."
     exit 1
@@ -59,9 +60,6 @@ while IFS=, read -r instance_name host_ip db_name; do
     continue
   fi
 
-  # Define the connection string dynamically for each database/host
-  CONNECTION_STRING="sqlcmd -S tcp:$host_ip,$SQL_SERVER_PORT -U \"$SQL_SERVER_USER\" -P \"$SQL_SERVER_PASSWORD\""
-  
   # Get current timestamp for file naming
   TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
   
@@ -75,8 +73,8 @@ while IFS=, read -r instance_name host_ip db_name; do
   # The BACKUP DATABASE command
   BACKUP_QUERY="BACKUP DATABASE [$db_name] TO URL = N'$BACKUP_URL' WITH COMPRESSION, STATS = 10, CHECKSUM, FORMAT; GO"
   
-  # Execute the backup
-  echo "$BACKUP_QUERY" | $CONNECTION_STRING
+  # Execute the backup with careful quoting of the password
+  echo "$BACKUP_QUERY" | sqlcmd -S tcp:"$host_ip","$SQL_SERVER_PORT" -U "$SQL_SERVER_USER" -P "$SQL_SERVER_PASSWORD"
   
   if [ $? -eq 0 ]; then
     echo "SUCCESS: Backup of database [$db_name] completed."
