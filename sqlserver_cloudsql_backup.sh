@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- SCRIPT SETUP ---
-# Source the configuration file to load all credentials and global settings
+# Source the configuration file to load all global settings
 CREDENTIALS_FILE="/backup/configs/sql_credentials.conf"
 if [ ! -f "$CREDENTIALS_FILE" ]; then
     echo "ERROR: Credentials file not found at $CREDENTIALS_FILE."
@@ -17,71 +17,53 @@ if [ ! -f "$DB_LIST_FILE" ]; then
 fi
 
 # --- SCRIPT LOGIC ---
+echo "Starting database export and compression process to Cloud Storage..."
 
-# Check if sqlcmd is installed
-if ! command -v sqlcmd &> /dev/null
+# Check if gsutil is installed
+if ! command -v gsutil &> /dev/null
 then
-    echo "ERROR: sqlcmd could not be found. Please install mssql-tools."
+    echo "ERROR: gsutil could not be found. Please ensure Google Cloud SDK is installed and configured."
     exit 1
 fi
-
-# --- STEP 1: CREATE OR UPDATE THE SQL SERVER CREDENTIAL FOR GCS ---
-# This step still needs a single, static connection to create the credential.
-# For simplicity and to avoid creating a credential per instance, we'll use the IP from the first line of the config file.
-echo "Checking for and creating/updating SQL Server credential for GCS..."
-FIRST_HOST_IP=$(head -n 1 "$DB_LIST_FILE" | awk -F, '{print $2}' | xargs)
-
-SQL_CREDENTIAL_QUERY="
-IF NOT EXISTS (SELECT * FROM sys.credentials WHERE name = '$SQL_CREDENTIAL_NAME')
-    CREATE CREDENTIAL [$SQL_CREDENTIAL_NAME] WITH IDENTITY = 'S3 Access Key', SECRET = '$HMAC_SECRET';
-ELSE
-    ALTER CREDENTIAL [$SQL_CREDENTIAL_NAME] WITH IDENTITY = 'S3 Access Key', SECRET = '$HMAC_SECRET';
-GO
-"
-# Execute the command with careful quoting of the password
-echo "$SQL_CREDENTIAL_QUERY" | sqlcmd -S tcp:"$FIRST_HOST_IP","$SQL_SERVER_PORT" -U "$SQL_SERVER_USER" -P "$SQL_SERVER_PASSWORD"
-if [ $? -ne 0 ]; then
-    echo "ERROR: Failed to create or update the SQL Server credential. Check your HMAC keys and permissions."
-    exit 1
-fi
-echo "SQL Server credential setup complete."
-
-# --- STEP 2: LOOP THROUGH DATABASES AND PERFORM BACKUPS ---
-echo "Starting full database backup process..."
 
 while IFS=, read -r instance_name host_ip db_name; do
-  # Trim any leading/trailing whitespace
-  instance_name=$(echo "$instance_name" | xargs)
-  host_ip=$(echo "$host_ip" | xargs)
-  db_name=$(echo "$db_name" | xargs)
+    # Trim any leading/trailing whitespace
+    instance_name=$(echo "$instance_name" | xargs)
+    db_name=$(echo "$db_name" | xargs)
 
-  # Skip empty or commented lines
-  if [[ -z "$db_name" || "$db_name" =~ ^# ]]; then
-    continue
-  fi
+    # Skip empty or commented lines
+    if [[ -z "$db_name" || "$db_name" =~ ^# ]]; then
+        continue
+    fi
 
-  # Get current timestamp for file naming
-  TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-  
-  # Construct the GCS path and file name based on your naming convention
-  GCS_FULL_PATH="$GCS_BASE_PATH/$instance_name/$db_name/FULL"
-  BACKUP_FILE_NAME="${instance_name}_${db_name}_FULL_$TIMESTAMP.bak"
-  BACKUP_URL="s3://storage.googleapis.com/$GCS_BUCKET_NAME/$GCS_FULL_PATH/$BACKUP_FILE_NAME"
+    # Get current timestamp for file naming in yyyy-mm-dd format
+    TIMESTAMP=$(date +"%Y-%m-%d")
+    
+    # Construct the GCS path and file name based on your new naming convention
+    GCS_FULL_PATH="$GCS_BASE_PATH/$instance_name/$db_name/FULL"
+    UNCOMPRESSED_BACKUP_URL="gs://$GCS_BUCKET_NAME/$GCS_FULL_PATH/${TIMESTAMP}_${db_name}.sql"
+    COMPRESSED_BACKUP_URL="gs://$GCS_BUCKET_NAME/$GCS_FULL_PATH/${TIMESTAMP}_${db_name}.sql.gz"
 
-  echo "Backing up database: [$db_name] on instance [$instance_name] to URL: $BACKUP_URL"
+    echo "Exporting database: [$db_name] on instance [$instance_name] to URL: $UNCOMPRESSED_BACKUP_URL"
 
-  # The BACKUP DATABASE command
-  BACKUP_QUERY="BACKUP DATABASE [$db_name] TO URL = N'$BACKUP_URL' WITH COMPRESSION, STATS = 10, CHECKSUM, FORMAT; GO"
-  
-  # Execute the backup with careful quoting of the password
-  echo "$BACKUP_QUERY" | sqlcmd -S tcp:"$host_ip","$SQL_SERVER_PORT" -U "$SQL_SERVER_USER" -P "$SQL_SERVER_PASSWORD"
-  
-  if [ $? -eq 0 ]; then
-    echo "SUCCESS: Backup of database [$db_name] completed."
-  else
-    echo "ERROR: Backup of database [$db_name] failed. Check SQL Server logs for details."
-  fi
+    # The gcloud command to perform the export
+    gcloud sql export sql "$instance_name" "$UNCOMPRESSED_BACKUP_URL" --database="$db_name"
 
+    if [ $? -eq 0 ]; then
+        echo "SUCCESS: Export of database [$db_name] completed. Starting compression..."
+
+        # Use gsutil to compress the exported file and store it with the .gz extension
+        gsutil cp "$UNCOMPRESSED_BACKUP_URL" "$COMPRESSED_BACKUP_URL"
+        if [ $? -eq 0 ]; then
+            echo "SUCCESS: Backup file compressed. Deleting uncompressed version."
+            # Delete the uncompressed version to save on storage
+            gsutil rm "$UNCOMPRESSED_BACKUP_URL"
+        else
+            echo "ERROR: Failed to compress backup file."
+        fi
+    else
+        echo "ERROR: Export of database [$db_name] failed. Check permissions and logs."
+    fi
 done < "$DB_LIST_FILE"
 
-echo "Database backup script finished."
+echo "Database export and compression script finished."
