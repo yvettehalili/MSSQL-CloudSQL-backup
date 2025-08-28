@@ -27,7 +27,6 @@ then
 fi
 
 if [ ! -f "$SERVICE_ACCOUNT_KEY_FILE" ]; then
-then
     echo "$(date +'%Y-%m-%d %H:%M:%S') [ERROR] Service account key file not found at '$SERVICE_ACCOUNT_KEY_FILE'."
     exit 1
 fi
