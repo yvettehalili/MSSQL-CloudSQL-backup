@@ -1,6 +1,7 @@
 #!/bin/bash
 
 # --- SCRIPT SETUP ---
+# Source the configuration file to load all variables
 CREDENTIALS_FILE="/backup/configs/sql_credentials.conf"
 if [ ! -f "$CREDENTIALS_FILE" ]; then
     echo "ERROR: Credentials file not found at $CREDENTIALS_FILE."
@@ -8,6 +9,7 @@ if [ ! -f "$CREDENTIALS_FILE" ]; then
 fi
 source "$CREDENTIALS_FILE"
 
+# Configuration file for the database list
 DB_LIST_FILE="/backup/configs/MSSQL_database_list.conf"
 if [ ! -f "$DB_LIST_FILE" ]; then
     echo "ERROR: Database list file not found at $DB_LIST_FILE."
@@ -15,70 +17,55 @@ if [ ! -f "$DB_LIST_FILE" ]; then
 fi
 
 # --- SCRIPT LOGIC ---
-if ! command -v sqlcmd &> /dev/null
+echo "Starting native .bak backup process to Cloud Storage..."
+
+# Check if gcloud is installed and the key file exists
+if ! command -v gcloud &> /dev/null
 then
-    echo "ERROR: sqlcmd could not be found. Please install mssql-tools."
+    echo "ERROR: gcloud command not found. Please ensure Google Cloud SDK is installed and authenticated."
     exit 1
 fi
 
-# Get the IP of the first instance to create the credential
-FIRST_HOST_IP=$(head -n 1 "$DB_LIST_FILE" | awk -F, '{print $2}' | xargs)
-if [ -z "$FIRST_HOST_IP" ]; then
-    echo "ERROR: Database list file is empty or formatted incorrectly."
+if [ ! -f "$SERVICE_ACCOUNT_KEY_FILE" ]; then
+    echo "ERROR: Service account key file not found at '$SERVICE_ACCOUNT_KEY_FILE'."
     exit 1
 fi
 
-# --- STEP 1: CREATE OR UPDATE THE SQL SERVER CREDENTIAL FOR GCS ---
-echo "Checking for and creating/updating SQL Server credential for GCS..."
-SQL_CREDENTIAL_QUERY="
-IF NOT EXISTS (SELECT * FROM sys.credentials WHERE name = '$SQL_CREDENTIAL_NAME')
-    CREATE CREDENTIAL [$SQL_CREDENTIAL_NAME] WITH IDENTITY = 'S3 Access Key', SECRET = '$HMAC_SECRET';
-ELSE
-    ALTER CREDENTIAL [$SQL_CREDENTIAL_NAME] WITH IDENTITY = 'S3 Access Key', SECRET = '$HMAC_SECRET';
-GO
-"
-# Use a temp file to pass the query to sqlcmd securely
-echo "$SQL_CREDENTIAL_QUERY" > /tmp/credential_query.sql
-sqlcmd -S tcp:"$FIRST_HOST_IP","$SQL_SERVER_PORT" -U "$SQL_SERVER_USER" -P "$SQL_SERVER_PASSWORD" -i /tmp/credential_query.sql
+# Activate the service account using the key file
+echo "Authenticating with service account..."
+gcloud auth activate-service-account --key-file="$SERVICE_ACCOUNT_KEY_FILE"
 if [ $? -ne 0 ]; then
-    echo "ERROR: Failed to create or update the SQL Server credential. Check your HMAC keys and permissions."
-    rm /tmp/credential_query.sql
+    echo "ERROR: Failed to authenticate with the service account. Check the key file and permissions."
     exit 1
 fi
-echo "SQL Server credential setup complete."
-rm /tmp/credential_query.sql
-
-# --- STEP 2: LOOP THROUGH DATABASES AND PERFORM BACKUPS ---
-echo "Starting full database backup process..."
+echo "Authentication successful."
 
 while IFS=, read -r instance_name host_ip db_name; do
-  instance_name=$(echo "$instance_name" | xargs)
-  host_ip=$(echo "$host_ip" | xargs)
-  db_name=$(echo "$db_name" | xargs)
+    # Trim any leading/trailing whitespace
+    instance_name=$(echo "$instance_name" | xargs)
+    db_name=$(echo "$db_name" | xargs)
 
-  if [[ -z "$db_name" || "$db_name" =~ ^# ]]; then
-    continue
-  fi
+    # Skip empty or commented lines
+    if [[ -z "$db_name" || "$db_name" =~ ^# ]]; then
+        continue
+    fi
 
-  TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-  GCS_FULL_PATH="$GCS_BASE_PATH/$instance_name/$db_name/FULL"
-  BACKUP_FILE_NAME="${instance_name}_${db_name}_FULL_$TIMESTAMP.bak"
-  BACKUP_URL="s3://storage.googleapis.com/$GCS_BUCKET_NAME/$GCS_FULL_PATH/$BACKUP_FILE_NAME"
+    # Get current timestamp for file naming
+    TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
-  echo "Backing up database: [$db_name] on instance [$instance_name] to URL: $BACKUP_URL"
+    # Construct the GCS URL for the native .bak backup file
+    BACKUP_URL="gs://$GCS_BUCKET_NAME/$GCS_BASE_PATH/$instance_name/$db_name/FULL/${instance_name}_${db_name}_FULL_$TIMESTAMP.bak"
 
-  BACKUP_QUERY="BACKUP DATABASE [$db_name] TO URL = N'$BACKUP_URL' WITH COMPRESSION, STATS = 10, CHECKSUM, FORMAT; GO"
-  
-  # Use a temp file to pass the query securely
-  echo "$BACKUP_QUERY" > /tmp/backup_query.sql
-  sqlcmd -S tcp:"$host_ip","$SQL_SERVER_PORT" -U "$SQL_SERVER_USER" -P "$SQL_SERVER_PASSWORD" -i /tmp/backup_query.sql
-  
-  if [ $? -eq 0 ]; then
-    echo "SUCCESS: Backup of database [$db_name] completed."
-  else
-    echo "ERROR: Backup of database [$db_name] failed. Check SQL Server logs for details."
-  fi
-  rm /tmp/backup_query.sql
+    echo "Backing up database: [$db_name] on instance [$instance_name] to URL: $BACKUP_URL"
+
+    # The gcloud command to perform the native .bak backup
+    gcloud sql export bak "$instance_name" "$BACKUP_URL" --database="$db_name" --quiet
+
+    if [ $? -eq 0 ]; then
+        echo "SUCCESS: Native .bak backup of database [$db_name] completed."
+    else
+        echo "ERROR: Native .bak backup of database [$db_name] failed. Check IAM permissions and logs."
+    fi
 done < "$DB_LIST_FILE"
 
 echo "Database backup script finished."
